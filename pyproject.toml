@@ -1,0 +1,15 @@
+[project]
+name = "rddm"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.4.0",
+    "neurokit2>=0.2.13",
+    "numpy>=2.5.3",
+    "requests>=2.34.2",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "torch>=2.15.0",
+    "tqdm>=4.70.1",
+    "wandb>=0.31.0",
+]
