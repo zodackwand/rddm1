@@ -462,6 +462,8 @@ def main():
         device = "mps"
     else:
         device = "cpu"
+    if "SLURM_JOB_ID" in os.environ and device != "cuda":
+        raise RuntimeError("no GPU available in a Slurm job, refusing to train on CPU")
     print(f"device {device}, {vars(args)}", flush=True)
 
     dataset = load_split(args.data_root, "train", args.datasets)
