@@ -113,6 +113,7 @@ def main():
     parser.add_argument("--out", required=True, help="folder for metrics.json and plots")
     parser.add_argument("--batch-size", type=int, default=512, help="FD depends on it, keep 512 as the authors")
     parser.add_argument("--gen-batch", type=int, default=512, help="lower it on CUDA out of memory")
+    parser.add_argument("--part", default="test", help="train only to diagnose overfitting")
     parser.add_argument("--max-windows", type=int, default=None, help="use only for a quick test")
     parser.add_argument("--seed", type=int, default=31)
     args = parser.parse_args()
@@ -130,7 +131,7 @@ def main():
     for name in args.datasets:
         results[name] = {}
         for seconds in [4, 8] if name in HR_DATASETS else [4]:
-            dataset = load_split(args.data_root, "test", [name], seconds)
+            dataset = load_split(args.data_root, args.part, [name], seconds)
             if args.max_windows:
                 dataset = torch.utils.data.Subset(dataset, range(min(args.max_windows, len(dataset))))
             real, fake, fd = run(models, dataset, args.batch_size, args.gen_batch, device, args.seed)
