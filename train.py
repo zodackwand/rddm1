@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import math
 import os
 import random
@@ -8,8 +9,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
 
 from data import DATASETS, ROOT
 
@@ -354,18 +356,31 @@ def generate_ecg(rddm, cond_net1, cond_net2, ppg):
     return rddm(cond1=cond_net1(ppg), cond2=cond_net2(ppg), mode="sample", window_size=ppg.shape[-1])
 
 
-def train_rddm(config, dataloader):
+class TrainStep(nn.Module):
+    # One module for DDP: the condition nets run outside RDDM.forward
+    def __init__(self, rddm, cond_net1, cond_net2):
+        super().__init__()
+        self.rddm = rddm
+        self.cond_net1 = cond_net1
+        self.cond_net2 = cond_net2
+
+    def forward(self, y_ecg, x_ppg, ecg_roi):
+        return self.rddm(x=y_ecg, cond1=self.cond_net1(x_ppg), cond2=self.cond_net2(x_ppg), patch_labels=ecg_roi)
+
+
+def train_rddm(config, dataloader, sampler=None):
     device = config["device"]
     path = config["path"]
+    rank, world = config["rank"], config["world"]
+    main_process = rank == 0
     os.makedirs(path, exist_ok=True)
 
     rddm = build_rddm(config["attention_heads"], config["nT"]).to(device)
     cond_net1 = ConditionNet().to(device)
     cond_net2 = ConditionNet().to(device)
+    step_model = TrainStep(rddm, cond_net1, cond_net2)
 
-    optim = torch.optim.AdamW(
-        [*rddm.parameters(), *cond_net1.parameters(), *cond_net2.parameters()], lr=config["lr"]
-    )
+    optim = torch.optim.AdamW(step_model.parameters(), lr=config["lr"])
     scheduler = make_scheduler(optim, config["t_warmup"], config["n_epoch"])
 
     # Resume after a Slurm time limit
@@ -378,45 +393,60 @@ def train_rddm(config, dataloader):
         cond_net2.load_state_dict(ckpt["cond_net2"])
         optim.load_state_dict(ckpt["optim"])
         scheduler.load_state_dict(ckpt["scheduler"])
-        torch.set_rng_state(ckpt["rng"].cpu().byte())  # map_location moved it to the GPU
         start_epoch = ckpt["epoch"] + 1
-        print(f"Resumed from epoch {ckpt['epoch']}", flush=True)
+        if main_process:
+            print(f"Resumed from epoch {ckpt['epoch']}", flush=True)
+
+    if world > 1:
+        device_ids = [config["local_rank"]] if device.startswith("cuda") else None
+        # inc_freq layers exist in the authors' networks but forward never uses them
+        step_model = nn.parallel.DistributedDataParallel(step_model, device_ids=device_ids, find_unused_parameters=True)
 
     for epoch in range(start_epoch, config["n_epoch"]):
-        rddm.train()
-        cond_net1.train()
-        cond_net2.train()
+        # Seeding per epoch makes a resumed run match an uninterrupted one
+        torch.manual_seed(config["seed"] * 1000 + epoch * world + rank)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        step_model.train()
         lr = optim.param_groups[0]["lr"]
-        ddpm_total, region_total, steps = 0.0, 0.0, 0
+        totals = torch.zeros(3, device=device)  # ddpm, region, steps
         started = time.time()
 
         for y_ecg, x_ppg, ecg_roi in dataloader:
-            y_ecg = y_ecg.to(device, non_blocking=True)
-            x_ppg = x_ppg.to(device, non_blocking=True)
-            ecg_roi = ecg_roi.to(device, non_blocking=True)
-
+            batch = [t.to(device, non_blocking=True) for t in (y_ecg, x_ppg, ecg_roi)]
             optim.zero_grad()
-            ddpm_loss, region_loss = rddm(
-                x=y_ecg, cond1=cond_net1(x_ppg), cond2=cond_net2(x_ppg), patch_labels=ecg_roi
-            )
-            loss = config["alpha1"] * ddpm_loss + config["alpha2"] * region_loss
-            loss.backward()
+            # Gradient accumulation: the batch is too large for one GPU at once
+            micro_batches = list(zip(*[t.split(config["micro_batch"]) for t in batch]))
+            for i, micro in enumerate(micro_batches):
+                share = micro[0].shape[0] / batch[0].shape[0]
+                last = i == len(micro_batches) - 1
+                # DDP syncs gradients only on the last micro-batch
+                sync = step_model.no_sync() if world > 1 and not last else contextlib.nullcontext()
+                with sync:
+                    ddpm_loss, region_loss = step_model(*micro)
+                    loss = config["alpha1"] * ddpm_loss + config["alpha2"] * region_loss
+                    (loss * share).backward()
+                totals[0] += ddpm_loss.detach() * share
+                totals[1] += region_loss.detach() * share
             optim.step()
-
-            ddpm_total += ddpm_loss.item()
-            region_total += region_loss.item()
-            steps += 1
-            if config["max_steps"] and steps >= config["max_steps"]:
+            totals[2] += 1
+            if config["max_steps"] and totals[2] >= config["max_steps"]:
                 break
 
-        if not math.isfinite(ddpm_total + region_total):
+        if world > 1:
+            dist.all_reduce(totals)
+        ddpm_mean, region_mean = (totals[:2] / totals[2]).tolist()
+        if not math.isfinite(ddpm_mean + region_mean):
             raise RuntimeError(f"loss is not finite at epoch {epoch}, last.pt keeps the previous epoch")
 
         scheduler.step()
+        if not main_process:
+            continue
         elapsed = time.time() - started
         memory = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0
+        steps = totals[2].item() / world
         print(
-            f"epoch {epoch} lr {lr:.2e} ddpm {ddpm_total / steps:.4f} region {region_total / steps:.4f} "
+            f"epoch {epoch} lr {lr:.2e} ddpm {ddpm_mean:.4f} region {region_mean:.4f} "
             f"steps/s {steps / elapsed:.2f} epoch_min {elapsed / 60:.1f} gpu_gb {memory:.1f}",
             flush=True,
         )
@@ -427,7 +457,6 @@ def train_rddm(config, dataloader):
             "cond_net2": cond_net2.state_dict(),
             "optim": optim.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "rng": torch.get_rng_state(),
             "epoch": epoch,
         }
         # Write then rename: a job killed mid-save won't corrupt last.pt
@@ -446,32 +475,47 @@ def main():
     parser.add_argument("--datasets", nargs="*", default=DATASETS)
     parser.add_argument("--path", required=True, help="checkpoint directory")
     parser.add_argument("--n-epoch", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=128, help="total over all GPUs")
+    parser.add_argument("--micro-batch", type=int, default=128, help="largest batch one GPU fits at once")
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=None, help="limit steps per epoch for a speed test")
     parser.add_argument("--seed", type=int, default=31)
     args = parser.parse_args()
+
+    # torchrun sets these; a plain python run is one process
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world = int(os.environ.get("WORLD_SIZE", 1))
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(local_rank)
+    elif torch.backends.mps.is_available() and world == 1:
         device = "mps"
     else:
         device = "cpu"
-    if "SLURM_JOB_ID" in os.environ and device != "cuda":
+    if "SLURM_JOB_ID" in os.environ and not device.startswith("cuda"):
         raise RuntimeError("no GPU available in a Slurm job, refusing to train on CPU")
-    print(f"device {device}, {vars(args)}", flush=True)
+    if world > 1:
+        dist.init_process_group("nccl" if device.startswith("cuda") else "gloo")
+
+    # 512 over 3 GPUs is 171 per GPU, 513 in total
+    per_rank_batch = math.ceil(args.batch_size / world)
+    if rank == 0:
+        print(f"device {device}, world {world}, batch per GPU {per_rank_batch}, {vars(args)}", flush=True)
 
     dataset = load_split(args.data_root, "train", args.datasets)
-    print(f"train windows: {len(dataset)}", flush=True)
-    workers = max(0, int(os.environ.get("SLURM_CPUS_PER_TASK", 1)) - 1)
+    if rank == 0:
+        print(f"train windows: {len(dataset)}", flush=True)
+    sampler = DistributedSampler(dataset, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None
+    workers = max(0, int(os.environ.get("SLURM_CPUS_PER_TASK", 1)) // world - 1)
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
-        num_workers=workers, pin_memory=device == "cuda", persistent_workers=workers > 0,
+        dataset, batch_size=per_rank_batch, shuffle=sampler is None, sampler=sampler, drop_last=True,
+        num_workers=workers, pin_memory=device.startswith("cuda"), persistent_workers=workers > 0,
     )
 
     config = {
@@ -484,10 +528,17 @@ def main():
         "alpha2": 1,
         "save_every": args.save_every,
         "max_steps": args.max_steps,
+        "micro_batch": args.micro_batch,
+        "seed": args.seed,
         "device": device,
         "path": args.path,
+        "rank": rank,
+        "local_rank": local_rank,
+        "world": world,
     }
-    train_rddm(config, dataloader)
+    train_rddm(config, dataloader, sampler)
+    if world > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
