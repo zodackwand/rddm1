@@ -316,10 +316,12 @@ class RDDM(nn.Module):
             return x_i
 
 
-def make_scheduler(optim, t_warmup, t_max):
+def make_scheduler(optim, t_warmup, t_max, constant=False):
     def lr_lambda(epoch):
         if epoch < t_warmup:
             return (epoch + 1) / t_warmup
+        if constant:
+            return 1.0
         return 0.5 * (1 + math.cos(math.pi * (epoch - t_warmup) / (t_max - t_warmup)))
     return torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
 
@@ -381,7 +383,13 @@ def train_rddm(config, dataloader, sampler=None):
     step_model = TrainStep(rddm, cond_net1, cond_net2)
 
     optim = torch.optim.AdamW(step_model.parameters(), lr=config["lr"])
-    scheduler = make_scheduler(optim, config["t_warmup"], config["n_epoch"])
+    scheduler = make_scheduler(optim, config["t_warmup"], config["t_max"] or config["n_epoch"], config["lr_schedule"] == "constant")
+
+    # Start from the authors' weights instead of a random init (a resumed run overrides this below)
+    if config["init_from"]:
+        rddm.load_state_dict(torch.load(f"{config['init_from']}/rddm_main_network.pth", map_location=device))
+        cond_net1.load_state_dict(torch.load(f"{config['init_from']}/rddm_condition_encoder_1.pth", map_location=device))
+        cond_net2.load_state_dict(torch.load(f"{config['init_from']}/rddm_condition_encoder_2.pth", map_location=device))
 
     # Resume after a Slurm time limit
     start_epoch = 0
@@ -480,6 +488,9 @@ def main():
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=None, help="limit steps per epoch for a speed test")
     parser.add_argument("--seed", type=int, default=31)
+    parser.add_argument("--init-from", help="folder with the authors' .pth files to start from")
+    parser.add_argument("--lr-schedule", choices=["cosine", "constant"], default="cosine")
+    parser.add_argument("--t-max", type=int, default=None, help="cosine length in epochs, default n-epoch (authors' code: 1000)")
     args = parser.parse_args()
 
     # torchrun sets these; a plain python run is one process
@@ -521,6 +532,9 @@ def main():
     config = {
         "n_epoch": args.n_epoch,
         "t_warmup": 20,
+        "t_max": args.t_max,
+        "lr_schedule": args.lr_schedule,
+        "init_from": args.init_from,
         "lr": 1e-4,
         "nT": 10,
         "attention_heads": 8,
