@@ -335,6 +335,35 @@ def load_split(root, part, datasets, seconds=4):
     return TensorDataset(*tensors)
 
 
+def load_shifted_train(root, datasets, offsets):
+    # The original train windows plus the same windows shifted by each offset (seconds)
+    arrays = {"ecg": [], "ppg": [], "roi": []}
+    for name in datasets:
+        for key in arrays:
+            arrays[key].append(np.load(Path(root) / name / f"{key}_train_4sec.npy"))
+            for offset in offsets:
+                arrays[key].append(np.load(Path(root) / name / f"{key}_train_4sec_off{offset}.npy"))
+    return TensorDataset(*[torch.from_numpy(np.concatenate(arrays[key])).float().unsqueeze(1) for key in ["ecg", "ppg", "roi"]])
+
+
+class EpochSubsetSampler:
+    # Every epoch draws a new random subset of per_epoch windows, split between the processes
+    def __init__(self, size, per_epoch, rank, world, seed):
+        self.size, self.per_epoch, self.rank, self.world, self.seed = size, per_epoch, rank, world, seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        order = torch.randperm(self.size, generator=torch.Generator().manual_seed(self.seed + self.epoch))
+        usable = self.per_epoch - self.per_epoch % self.world
+        return iter(order[:usable][self.rank::self.world].tolist())
+
+    def __len__(self):
+        return (self.per_epoch - self.per_epoch % self.world) // self.world
+
+
 def build_rddm(num_heads=8, n_T=10):
     return RDDM(
         eps_model=DiffusionUNetCrossAttention(num_heads=num_heads),
@@ -488,6 +517,8 @@ def main():
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=None, help="limit steps per epoch for a speed test")
     parser.add_argument("--seed", type=int, default=31)
+    parser.add_argument("--shift-offsets", type=int, nargs="*", default=[],
+                        help="seconds of the shifted train windows from preprocess.py --offset; each epoch uses a random subset of the original size")
     parser.add_argument("--init-from", help="folder with the authors' .pth files to start from")
     parser.add_argument("--lr-schedule", choices=["cosine", "constant"], default="cosine")
     parser.add_argument("--t-max", type=int, default=None, help="cosine length in epochs, default n-epoch (authors' code: 1000)")
@@ -519,10 +550,15 @@ def main():
     if rank == 0:
         print(f"device {device}, world {world}, batch per GPU {per_rank_batch}, {vars(args)}", flush=True)
 
-    dataset = load_split(args.data_root, "train", args.datasets)
+    if args.shift_offsets:
+        dataset = load_shifted_train(args.data_root, args.datasets, args.shift_offsets)
+        per_epoch = len(load_split(args.data_root, "train", args.datasets))  # same steps per epoch as without shifts
+        sampler = EpochSubsetSampler(len(dataset), per_epoch, rank, world, args.seed)
+    else:
+        dataset = load_split(args.data_root, "train", args.datasets)
+        sampler = DistributedSampler(dataset, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None
     if rank == 0:
-        print(f"train windows: {len(dataset)}", flush=True)
-    sampler = DistributedSampler(dataset, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None
+        print(f"train windows: {len(dataset)}, shifts {args.shift_offsets}", flush=True)
     workers = max(0, int(os.environ.get("SLURM_CPUS_PER_TASK", 1)) // world - 1)
     dataloader = DataLoader(
         dataset, batch_size=per_rank_batch, shuffle=sampler is None, sampler=sampler, drop_last=True,

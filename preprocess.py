@@ -137,7 +137,9 @@ def process_window(ecg, ppg):
 
 
 def process_subject(job):
-    name, subject, args = job
+    # job: (dataset, subject, loader args[, offset in seconds, window lengths]); the extras are for shifted windows
+    name, subject, args, *extra = job
+    offset, window_seconds = extra if extra else (0, WINDOW_SECONDS)
     warnings.filterwarnings("ignore")
     out = {"name": name, "subject": subject, "windows": {}, "dropped": 0, "error": None}
     try:
@@ -151,10 +153,10 @@ def process_subject(job):
         ppg = sosfiltfilt(butter(FILTER_ORDER, [0.5, 8], "bandpass", fs=FS, output="sos"), ppg[:n])
         ecg, ppg = zscore(ecg), zscore(ppg)
 
-        for seconds in WINDOW_SECONDS:
+        for seconds in window_seconds:
             length = seconds * FS
             rows = []
-            for start in range(0, n - length + 1, length):
+            for start in range(offset * FS, n - length + 1, length):
                 ecg_w, ppg_w = ecg[start:start + length], ppg[start:start + length]
                 # Flat windows have no min-max range and no R-peaks
                 if np.ptp(ecg_w) < FLAT_RANGE or np.ptp(ppg_w) < FLAT_RANGE:
@@ -178,15 +180,37 @@ def split_subjects(subjects):
     return shuffled[n_test:], shuffled[:n_test]
 
 
+def main_shifted(args, root):
+    # Train windows of 4 s that start `offset` seconds later: the same subjects and the same preprocessing,
+    # saved next to the originals as *_train_4sec_off<offset>.npy. The split is read from splits.json, never redrawn.
+    for name in args.datasets:
+        train = json.load(open(root / name / "splits.json"))["train"]
+        listing = dict(LOADERS[name][0](root))
+        jobs = [(name, s, listing[s], args.offset, [4]) for s in train]
+        print(f"=== {name}: {len(jobs)} train subjects, offset {args.offset} s", flush=True)
+        with ProcessPoolExecutor(args.workers) as pool:
+            results = list(pool.map(process_subject, jobs))
+        for r in results:
+            if r["error"]:
+                print(f"  skipped {r['subject']}: {r['error']}", flush=True)
+        data = np.concatenate([r["windows"][4] for r in results if 4 in r["windows"]])
+        for i, key in enumerate(["ecg", "ppg", "roi"]):
+            np.save(root / name / f"{key}_train_4sec_off{args.offset}.npy", data[:, i])
+        print(f"  train 4s offset {args.offset}: {data.shape[0]} windows", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=str(ROOT))
     parser.add_argument("--datasets", nargs="*", default=DATASETS)
     parser.add_argument("--workers", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 1)))
     parser.add_argument("--max-subjects", type=int, default=None, help="use only for a quick test")
+    parser.add_argument("--offset", type=int, default=0, help="seconds; above 0 builds only shifted train windows")
     args = parser.parse_args()
 
     root = Path(args.root)
+    if args.offset:
+        return main_shifted(args, root)
 
     for name in args.datasets:
         subjects = LOADERS[name][0](root)[:args.max_subjects]
