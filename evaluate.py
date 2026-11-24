@@ -73,7 +73,7 @@ def run(models, dataset, batch_size, gen_batch, device, seed):
     # Same order as the authors: shuffled batches of 512, FD averaged over batches
     torch.manual_seed(seed)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    reals, fakes, fds = [], [], []
+    reals, fakes, ppgs, fds = [], [], [], []
     for y_ecg, x_ppg, _ in loader:
         parts = []
         for ppg in torch.split(x_ppg, gen_batch):
@@ -84,8 +84,9 @@ def run(models, dataset, batch_size, gen_batch, device, seed):
         real = y_ecg.squeeze(1).numpy().astype(np.float64)
         fds.append(calculate_fd(real, fake))
         reals.append(real)
+        ppgs.append(x_ppg.squeeze(1).numpy().astype(np.float32))
         fakes.append(fake)
-    return np.concatenate(reals), np.concatenate(fakes), float(np.mean(fds))
+    return np.concatenate(reals), np.concatenate(fakes), np.concatenate(ppgs), float(np.mean(fds))
 
 
 def plot(real, fake, path, title):
@@ -134,7 +135,7 @@ def main():
             dataset = load_split(args.data_root, args.part, [name], seconds)
             if args.max_windows:
                 dataset = torch.utils.data.Subset(dataset, range(min(args.max_windows, len(dataset))))
-            real, fake, fd = run(models, dataset, args.batch_size, args.gen_batch, device, args.seed)
+            real, fake, ppg, fd = run(models, dataset, args.batch_size, args.gen_batch, device, args.seed)
             if seconds == 4:
                 # Table 1: RMSE and FD on 4 s windows
                 results[name]["rmse"] = float(np.sqrt(np.mean((fake - real) ** 2)))
@@ -143,7 +144,7 @@ def main():
                 # Table 2: heart rate on 8 s windows
                 results[name]["mae_hr"], results[name]["hr_found"] = mae_hr(real, fake)
             results[name][f"windows_{seconds}s"] = len(real)
-            np.savez(out / f"{name}_{seconds}sec.npz", real=real.astype(np.float32), fake=fake.astype(np.float32))
+            np.savez(out / f"{name}_{seconds}sec.npz", real=real.astype(np.float32), fake=fake.astype(np.float32), ppg=ppg)
             plot(real, fake, out / f"{name}_{seconds}sec.png", f"{name}, {seconds} s")
             print(name, seconds, results[name], flush=True)
 
