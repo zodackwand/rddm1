@@ -206,6 +206,8 @@ def main():
     parser.add_argument("--workers", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 1)))
     parser.add_argument("--max-subjects", type=int, default=None, help="use only for a quick test")
     parser.add_argument("--offset", type=int, default=0, help="seconds; above 0 builds only shifted train windows")
+    parser.add_argument("--ids-only", action="store_true",
+                        help="only write subj_<part>_<sec>sec.npy (subject of every window); existing arrays are not touched")
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -233,6 +235,17 @@ def main():
         train, test = split_subjects(usable)
         assert not set(train) & set(test)
         out_dir = root / name
+        if args.ids_only:
+            saved = json.load(open(out_dir / "splits.json"))
+            assert saved["train"] == train and saved["test"] == test, "split differs from splits.json"
+            for seconds in WINDOW_SECONDS:
+                for part, ids in [("train", train), ("test", test)]:
+                    subj = np.concatenate([[s] * len(usable[s]["windows"][seconds]) for s in ids if seconds in usable[s]["windows"]])
+                    n_saved = len(np.load(out_dir / f"ecg_{part}_{seconds}sec.npy", mmap_mode="r"))
+                    assert len(subj) == n_saved, f"{name} {part} {seconds}s: {len(subj)} ids vs {n_saved} windows"
+                    np.save(out_dir / f"subj_{part}_{seconds}sec.npy", subj.astype(str))
+                    print(f"  {part} {seconds}s: ids for {len(subj)} windows", flush=True)
+            continue
         for seconds in WINDOW_SECONDS:
             for part, ids in [("train", train), ("test", test)]:
                 arrays = [usable[s]["windows"][seconds] for s in ids if seconds in usable[s]["windows"]]

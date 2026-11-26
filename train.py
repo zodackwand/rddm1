@@ -346,6 +346,35 @@ def load_shifted_train(root, datasets, offsets):
     return TensorDataset(*[torch.from_numpy(np.concatenate(arrays[key])).float().unsqueeze(1) for key in ["ecg", "ppg", "roi"]])
 
 
+def load_subject_ids(root, datasets, part="train", seconds=4):
+    # The same concatenation order as load_split; written by preprocess.py --ids-only
+    return np.concatenate([np.char.add(f"{name}/", np.load(Path(root) / name / f"subj_{part}_{seconds}sec.npy"))
+                           for name in datasets])
+
+
+class SubjectBalancedSampler:
+    # Every epoch takes at most per_subject random windows from each subject, so long recordings
+    # (WESAD, DALIA: ~1500-2000 windows per person) do not dominate; short ones are used whole
+    def __init__(self, subject_ids, per_subject, rank, world, seed):
+        self.groups = [np.flatnonzero(subject_ids == s) for s in np.unique(subject_ids)]
+        self.per_subject, self.rank, self.world, self.seed = per_subject, rank, world, seed
+        self.total = sum(min(len(g), per_subject) for g in self.groups)
+        self.total -= self.total % world
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        picked = np.concatenate([rng.permutation(g)[:self.per_subject] for g in self.groups])
+        picked = rng.permutation(picked)[:self.total]
+        return iter(picked[self.rank::self.world].tolist())
+
+    def __len__(self):
+        return self.total // self.world
+
+
 class EpochSubsetSampler:
     # Every epoch draws a new random subset of per_epoch windows, split between the processes
     def __init__(self, size, per_epoch, rank, world, seed):
@@ -389,14 +418,22 @@ def generate_ecg(rddm, cond_net1, cond_net2, ppg):
 
 class TrainStep(nn.Module):
     # One module for DDP: the condition nets run outside RDDM.forward
-    def __init__(self, rddm, cond_net1, cond_net2):
+    def __init__(self, rddm, cond_net1, cond_net2, cond_drop=0.0):
         super().__init__()
         self.rddm = rddm
         self.cond_net1 = cond_net1
         self.cond_net2 = cond_net2
+        self.cond_drop = cond_drop
 
     def forward(self, y_ecg, x_ppg, ecg_roi):
-        return self.rddm(x=y_ecg, cond1=self.cond_net1(x_ppg), cond2=self.cond_net2(x_ppg), patch_labels=ecg_roi)
+        cond1, cond2 = self.cond_net1(x_ppg), self.cond_net2(x_ppg)
+        if self.training and self.cond_drop > 0:
+            # Condition dropout: for a random share of the batch the PPG features are zeroed.
+            # Zeroing the PPG itself breaks GroupNorm in ConditionNet (constant input, infinite gradients).
+            keep = torch.rand(x_ppg.shape[0], 1, 1, device=x_ppg.device) >= self.cond_drop
+            drop = lambda c: {k: [torch.where(keep, t, torch.zeros_like(t)) for t in v] for k, v in c.items()}
+            cond1, cond2 = drop(cond1), drop(cond2)
+        return self.rddm(x=y_ecg, cond1=cond1, cond2=cond2, patch_labels=ecg_roi)
 
 
 def train_rddm(config, dataloader, sampler=None):
@@ -409,7 +446,7 @@ def train_rddm(config, dataloader, sampler=None):
     rddm = build_rddm(config["attention_heads"], config["nT"]).to(device)
     cond_net1 = ConditionNet().to(device)
     cond_net2 = ConditionNet().to(device)
-    step_model = TrainStep(rddm, cond_net1, cond_net2)
+    step_model = TrainStep(rddm, cond_net1, cond_net2, config["cond_drop"])
 
     optim = torch.optim.AdamW(step_model.parameters(), lr=config["lr"])
     scheduler = make_scheduler(optim, config["t_warmup"], config["t_max"] or config["n_epoch"], config["lr_schedule"] == "constant")
@@ -522,6 +559,9 @@ def main():
     parser.add_argument("--init-from", help="folder with the authors' .pth files to start from")
     parser.add_argument("--lr-schedule", choices=["cosine", "constant"], default="cosine")
     parser.add_argument("--t-max", type=int, default=None, help="cosine length in epochs, default n-epoch (authors' code: 1000)")
+    parser.add_argument("--per-subject", type=int, default=None,
+                        help="balance subjects: at most this many random windows per subject in every epoch")
+    parser.add_argument("--cond-drop", type=float, default=0.0, help="share of samples trained with a zero PPG")
     args = parser.parse_args()
 
     # torchrun sets these; a plain python run is one process
@@ -550,7 +590,16 @@ def main():
     if rank == 0:
         print(f"device {device}, world {world}, batch per GPU {per_rank_batch}, {vars(args)}", flush=True)
 
-    if args.shift_offsets:
+    if args.per_subject and args.shift_offsets:
+        raise ValueError("--per-subject and --shift-offsets are not combined")
+    if args.per_subject:
+        dataset = load_split(args.data_root, "train", args.datasets)
+        subject_ids = load_subject_ids(args.data_root, args.datasets)
+        assert len(subject_ids) == len(dataset), "subject ids do not match the train windows"
+        sampler = SubjectBalancedSampler(subject_ids, args.per_subject, rank, world, args.seed)
+        if rank == 0:
+            print(f"subjects: {len(sampler.groups)}, windows per epoch: {sampler.total}", flush=True)
+    elif args.shift_offsets:
         dataset = load_shifted_train(args.data_root, args.datasets, args.shift_offsets)
         per_epoch = len(load_split(args.data_root, "train", args.datasets))  # same steps per epoch as without shifts
         sampler = EpochSubsetSampler(len(dataset), per_epoch, rank, world, args.seed)
@@ -571,6 +620,7 @@ def main():
         "t_max": args.t_max,
         "lr_schedule": args.lr_schedule,
         "init_from": args.init_from,
+        "cond_drop": args.cond_drop,
         "lr": 1e-4,
         "nT": 10,
         "attention_heads": 8,

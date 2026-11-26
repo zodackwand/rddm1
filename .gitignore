@@ -7,3 +7,7 @@ __pycache__/
 runs/
 *.log
 check_plots/
+
+# experiment outputs stay on the cluster and are copied to the laptop
+experiments/*/results/
+experiments/*/logs/
